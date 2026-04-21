@@ -5,6 +5,8 @@ import { z } from "zod";
 import { listAvailableScenarios, generateDataset } from "../generators/v1-generator.js";
 import { ALL_SCENARIOS } from "../templates/scenarios/index.js";
 import { PENTESTING_TOOLS } from "../schemas/tools/index.js";
+import { SeededRNG } from "../generators/outputs/index.js";
+import { buildConversationV2 } from "../generators/v2/conversation.js";
 import * as fsp from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -70,17 +72,24 @@ export function registerBrowseTools(server: McpServer) {
         return { content: [{ type: "text", text: `Scenario not found: ${args.scenario_id}` }], isError: true };
       }
 
-      const result = await generateDataset({
-        count: 1,
-        outputDir: path.join(os.tmpdir(), "pentesterflow-preview"),
-        thinkingRatio: args.include_thinking ? 1.0 : 0.0,
-        minTurns: 8,
-        maxTurns: 15,
-      });
-
-      const content = (await fsp.readFile(result.outputPath, "utf-8")).trim();
-      const entry = JSON.parse(content);
-      await fsp.unlink(result.outputPath);
+      // Build the exact requested scenario instead of delegating to the V1 generator,
+      // which only samples from the full pool and can preview a different scenario.
+      const entry = buildConversationV2(
+        scenario,
+        new SeededRNG(Date.now()),
+        {
+          count: 1,
+          outputDir: path.join(os.tmpdir(), "pentesterflow-preview"),
+          thinkingRatio: args.include_thinking ? 1.0 : 0.0,
+          failureRatio: 0.35,
+          minTurns: 8,
+          maxTurns: 15,
+          maxTokensPerEntry: 0,
+          thinkingStyle: "inline",
+        },
+        0
+      );
+      const content = JSON.stringify(entry, null, 2);
 
       return {
         content: [{

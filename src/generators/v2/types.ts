@@ -35,6 +35,7 @@ export interface ConversationMetadata {
   tools_used: string[];
   has_thinking: boolean;
   has_failures: boolean;
+  is_triage?: boolean;
   turn_count: number;
   cve_references: string[];
   estimated_tokens: number;

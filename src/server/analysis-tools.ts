@@ -85,11 +85,15 @@ export function registerAnalysisTools(server: McpServer) {
             if (msgs[0]?.from !== "system") warnings.push(`Line ${lineNum + 1}: First message is not 'system' role`);
 
             let hasHuman = false, hasGpt = false;
-            for (const msg of msgs) {
+            for (let msgIdx = 0; msgIdx < msgs.length; msgIdx++) {
+              const msg = msgs[msgIdx];
               if (!["system", "human", "gpt", "tool", "observation"].includes(msg.from)) issues.push(`Line ${lineNum + 1}: Invalid role '${msg.from}'`);
               if (!msg.value || typeof msg.value !== "string") issues.push(`Line ${lineNum + 1}: Empty or invalid message value`);
               if (msg.from === "human") hasHuman = true;
               if (msg.from === "gpt") hasGpt = true;
+              if (msg.from === "gpt" && msg.tool_calls?.length > 0 && msgIdx > 0 && msgs[msgIdx - 1]?.from === "observation") {
+                warnings.push(`Line ${lineNum + 1}: Observation appears before assistant tool call (backwards tool sequence)`);
+              }
             }
             if (!hasHuman) issues.push(`Line ${lineNum + 1}: No human messages`);
             if (!hasGpt) issues.push(`Line ${lineNum + 1}: No assistant messages`);
@@ -135,6 +139,11 @@ export function registerAnalysisTools(server: McpServer) {
         const uniqueDomains = new Set<string>(), uniqueTools = new Set<string>(), promptDiversity = new Set<string>();
         let unreplacedPlaceholders = 0, shortConversations = 0;
 
+        // Entry-level counters so the ratio metrics below divide by sampleSize
+        // using the same unit on both sides. Previously these were summed per
+        // message and divided per entry, producing values like 190%.
+        let entriesWithThinking = 0, entriesWithToolCalls = 0, entriesWithCode = 0, entriesWithReport = 0;
+
         for (const idx of indices) {
           try {
             const entry = JSON.parse(lines[idx]);
@@ -145,16 +154,38 @@ export function registerAnalysisTools(server: McpServer) {
             if (fullText.includes("target.com") || fullText.includes("{domain}")) unreplacedPlaceholders++;
             if (msgs.length < 6) shortConversations++;
 
+            let entryHasThinking = false, entryHasToolCall = false, entryHasCode = false, entryHasReport = false;
             for (const msg of msgs) {
               if (msg.from === "gpt") {
                 responseLengths.push(msg.value?.length || 0);
-                if (msg.thinking) { withThinking++; thinkingLengths.push(msg.thinking.length); }
-                if (msg.tool_calls?.length > 0) withToolCalls++;
-                if (msg.value?.includes("```")) withCode++;
-                if (msg.value?.includes("CVSS") || msg.value?.includes("Remediation")) withReport++;
+                // Thinking can live in msg.thinking OR inline as <think>...</think>
+                // inside msg.value (Qwen inline format).
+                if (msg.thinking) {
+                  withThinking++;
+                  thinkingLengths.push(msg.thinking.length);
+                  entryHasThinking = true;
+                } else if (msg.value?.includes("<think>")) {
+                  withThinking++;
+                  const inline = msg.value.match(/<think>([\s\S]*?)<\/think>/);
+                  if (inline) thinkingLengths.push(inline[1].length);
+                  entryHasThinking = true;
+                }
+                if (msg.tool_calls?.length > 0) {
+                  withToolCalls++;
+                  entryHasToolCall = true;
+                  // Tool diversity from real tool_call names — metadata.tools_used
+                  // can miss unnamed bash calls.
+                  for (const tc of msg.tool_calls) if (tc.name) uniqueTools.add(tc.name);
+                }
+                if (msg.value?.includes("```")) { withCode++; entryHasCode = true; }
+                if (msg.value?.includes("CVSS") || msg.value?.includes("Remediation")) { withReport++; entryHasReport = true; }
               }
               if (msg.from === "human") promptDiversity.add(msg.value?.slice(0, 50) || "");
             }
+            if (entryHasThinking) entriesWithThinking++;
+            if (entryHasToolCall) entriesWithToolCalls++;
+            if (entryHasCode) entriesWithCode++;
+            if (entryHasReport) entriesWithReport++;
             if (entry.metadata?.has_failures) withFailures++;
             if (entry.metadata?.tools_used) for (const t of entry.metadata.tools_used) uniqueTools.add(t);
             const domainMatch = fullText.match(/https?:\/\/([\w.-]+)/);
@@ -164,17 +195,22 @@ export function registerAnalysisTools(server: McpServer) {
 
         const avgResponseLen = responseLengths.reduce((a, b) => a + b, 0) / responseLengths.length;
         const avgThinkingLen = thinkingLengths.length > 0 ? thinkingLengths.reduce((a, b) => a + b, 0) / thinkingLengths.length : 0;
+        // Clamp every metric to [0, 1]. Several ratios (thinking, toolCall, code, report)
+        // are counted per-message, so a dataset with rich multi-turn entries can push
+        // them above 1.0 and break the bar renderer below.
+        const clamp = (v: number) => Math.max(0, Math.min(v, 1.0));
         const metrics = {
-          turnDepth: Math.min(totalTurns / (sampleSize * 10), 1.0),
-          thinkingRatio: withThinking / (sampleSize * 3),
-          toolCallRatio: withToolCalls / sampleSize,
-          codeRatio: withCode / sampleSize,
-          reportRatio: withReport / sampleSize,
-          domainDiversity: Math.min(uniqueDomains.size / 20, 1.0),
-          toolDiversity: Math.min(uniqueTools.size / 30, 1.0),
-          promptDiversity: Math.min(promptDiversity.size / (sampleSize * 0.5), 1.0),
-          noPlaceholders: 1.0 - (unreplacedPlaceholders / sampleSize),
-          noShortConvos: 1.0 - (shortConversations / sampleSize),
+          turnDepth: clamp(totalTurns / (sampleSize * 10)),
+          // Entry-level ratios — numerator and denominator now use the same unit.
+          thinkingRatio: clamp(entriesWithThinking / sampleSize),
+          toolCallRatio: clamp(entriesWithToolCalls / sampleSize),
+          codeRatio: clamp(entriesWithCode / sampleSize),
+          reportRatio: clamp(entriesWithReport / sampleSize),
+          domainDiversity: clamp(uniqueDomains.size / 20),
+          toolDiversity: clamp(uniqueTools.size / 30),
+          promptDiversity: clamp(promptDiversity.size / (sampleSize * 0.5)),
+          noPlaceholders: clamp(1.0 - (unreplacedPlaceholders / sampleSize)),
+          noShortConvos: clamp(1.0 - (shortConversations / sampleSize)),
         };
         const overallScore = Object.values(metrics).reduce((a, b) => a + b, 0) / Object.keys(metrics).length;
         const grade = overallScore >= 0.85 ? "A" : overallScore >= 0.7 ? "B" : overallScore >= 0.55 ? "C" : overallScore >= 0.4 ? "D" : "F";
@@ -182,7 +218,7 @@ export function registerAnalysisTools(server: McpServer) {
         return {
           content: [{
             type: "text",
-            text: `Dataset Quality Analysis\n════════════════════════\n\nFile: ${args.file_path}\nSampled: ${sampleSize} of ${lines.length}\nGrade: ${grade} (${(overallScore * 100).toFixed(1)}%)\n\nTokens: ~${totalTokenEstimate.toLocaleString()} total, ~${Math.round(totalTokenEstimate / sampleSize).toLocaleString()}/entry\nAvg response: ${Math.round(avgResponseLen).toLocaleString()} chars | Avg thinking: ${Math.round(avgThinkingLen).toLocaleString()} chars\nAvg turns: ${(totalTurns / sampleSize).toFixed(1)}\n\nContent: thinking=${((withThinking / (sampleSize * 3)) * 100).toFixed(1)}% | tools=${((withToolCalls / sampleSize) * 100).toFixed(1)}% | code=${((withCode / sampleSize) * 100).toFixed(1)}% | reports=${((withReport / sampleSize) * 100).toFixed(1)}%\n\nDiversity: ${uniqueDomains.size} domains, ${uniqueTools.size} tools, ${promptDiversity.size} unique prompts\n\nMetrics:\n${Object.entries(metrics).map(([k, v]) => `  ${k.padEnd(20)} ${(v * 100).toFixed(0).padStart(3)}%${"█".repeat(Math.round(v * 20))}${"░".repeat(20 - Math.round(v * 20))}`).join("\n")}\n\n${overallScore >= 0.7 ? "Training-ready." : "Consider regenerating low-quality entries."}`,
+            text: `Dataset Quality Analysis\n════════════════════════\n\nFile: ${args.file_path}\nSampled: ${sampleSize} of ${lines.length}\nGrade: ${grade} (${(overallScore * 100).toFixed(1)}%)\n\nTokens: ~${totalTokenEstimate.toLocaleString()} total, ~${Math.round(totalTokenEstimate / sampleSize).toLocaleString()}/entry\nAvg response: ${Math.round(avgResponseLen).toLocaleString()} chars | Avg thinking: ${Math.round(avgThinkingLen).toLocaleString()} chars\nAvg turns: ${(totalTurns / sampleSize).toFixed(1)}\n\nContent (entry-level): thinking=${((entriesWithThinking / sampleSize) * 100).toFixed(1)}% | tools=${((entriesWithToolCalls / sampleSize) * 100).toFixed(1)}% | code=${((entriesWithCode / sampleSize) * 100).toFixed(1)}% | reports=${((entriesWithReport / sampleSize) * 100).toFixed(1)}%\n\nDiversity: ${uniqueDomains.size} domains, ${uniqueTools.size} tools, ${promptDiversity.size} unique prompts\n\nMetrics:\n${Object.entries(metrics).map(([k, v]) => `  ${k.padEnd(20)} ${(v * 100).toFixed(0).padStart(3)}%${"█".repeat(Math.round(v * 20))}${"░".repeat(20 - Math.round(v * 20))}`).join("\n")}\n\n${overallScore >= 0.7 ? "Training-ready." : "Consider regenerating low-quality entries."}`,
           }],
         };
       } catch (error) {

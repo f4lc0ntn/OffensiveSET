@@ -39,10 +39,67 @@ export function variateText(text: string, domain: string, profile: TargetProfile
     .replace(/postgresql/g, profile.databases.name.toLowerCase());
 }
 
-// FIX #2 + #4 + #7: Grounded Response Generator
+// Classify a tool-output string into a coarse failure category so downstream
+// narrative can match the actual observation instead of claiming a mismatched
+// cause (e.g. rate limiting when the connection was refused).
+export function classifyFailure(observation: string): "unreachable" | "ratelimited" | "blocked" | "timeout" | "generic" {
+  const o = observation || "";
+  if (/Connection refused|Failed to connect|Could not resolve|No route to host|Host unreachable|Name or service not known/i.test(o)) return "unreachable";
+  if (/\b429\b|rate[- ]?limit|Too Many Requests|throttl/i.test(o)) return "ratelimited";
+  if (/\b403\b|\b406\b|WAF|blocked by|denied by policy|cloudflare|akamai|imperva|mod_security/i.test(o)) return "blocked";
+  if (/timed out|timeout|no response|operation timed/i.test(o)) return "timeout";
+  return "generic";
+}
+
+// Pre-call intent response: what the assistant says BEFORE running a tool.
+// Must not reference tool output — the tool hasn't run yet. Keeps it short and
+// stateable so the subsequent tool_call reads as an action, not a conclusion.
+export function generateIntentResponse(
+  rng: SeededRNG,
+  phase: AttackPhase,
+  profile: TargetProfile,
+  domain: string,
+  actualTools?: string[]
+): string {
+  const tech = rng.pick(profile.technologies);
+  // Prefer names of the tools actually being invoked this turn — otherwise the
+  // intent narration can claim a tool the tool_call does not use.
+  const toolPool = (actualTools && actualTools.length > 0) ? actualTools : (phase.tools || ["the next tool"]);
+  const tool = rng.pick(toolPool);
+  const verb = rng.pick([
+    "Let me",
+    "I'll",
+    "Going to",
+    "Next I'll",
+    "My plan is to",
+  ]);
+  const goal = rng.pick([
+    `run ${tool} against ${domain} to ${phase.description.toLowerCase()}`,
+    `kick off ${phase.phase.toLowerCase()} with ${tool} — focus is ${phase.description.toLowerCase()}`,
+    `use ${tool} for ${phase.phase.toLowerCase()}; I want to see how the ${tech} stack responds`,
+    `probe ${domain} with ${tool} and look for ${rng.pick([
+      "anomalous responses",
+      "exposed endpoints",
+      "version banners",
+      "parameter reflection",
+      "auth misconfigurations",
+    ])}`,
+    `execute the ${phase.phase.toLowerCase()} step. ${tool} is the right choice here because ${rng.pick([
+      "it handles this surface efficiently",
+      "it gives me the signal I need without noise",
+      "it matches the target's stack",
+      "it's the standard tool for this phase",
+    ])}`,
+  ]);
+  return `${verb} ${goal}.`;
+}
+
+// FIX #2 + #4 + #7 + #14: Grounded Response Generator
 // - Varies format (no always-## headers)
 // - Grounds analysis in tool output data
 // - Longer responses when thinking is present
+// - Analysis narration names the tool(s) that actually ran (actualTools),
+//   not the scenario-level phase.tools list.
 export function generateGroundedResponse(
   rng: SeededRNG,
   phase: AttackPhase,
@@ -50,7 +107,8 @@ export function generateGroundedResponse(
   domain: string,
   isFailure: boolean,
   toolOutputSummary: string,
-  hasThinking: boolean
+  hasThinking: boolean,
+  actualTools: string[] = []
 ): string {
   // FIX #2: 40% with headers, 60% without — natural conversation
   const useHeader = rng.bool(0.4);
@@ -66,7 +124,39 @@ export function generateGroundedResponse(
   }
 
   // FIX #7: Build opening that references ACTUAL tool output
-  const opening = generateAnalysisResponse(rng, phase, profile, domain, isFailure);
+  const opening = generateAnalysisResponse(rng, phase, profile, domain, isFailure, actualTools);
+
+  // FIX #18: mandatory tool attribution in post-observation analysis.
+  // When tool_calls actually ran this turn, the analysis MUST name at least
+  // one of them — otherwise the model learns to describe findings without
+  // referencing where the evidence came from. The opening and fragment
+  // pools already pick from actualTools, but nothing guarantees the name
+  // survives into the rendered string, so we append a short attribution
+  // line that cannot be rng'd away.
+  let mandatoryAttribution = "";
+  if (actualTools.length > 0) {
+    const t = rng.pick(actualTools);
+    const verb = rng.pick([
+      "Looking at the",
+      "Reviewing the",
+      "From the",
+      "Based on the",
+      "Inspecting the",
+    ]);
+    const tail = isFailure
+      ? rng.pick([
+          "output, the attempt did not yield the evidence I was probing for.",
+          "output, I can see why this particular vector did not succeed here.",
+          "output, the failure signal is clear enough to document and move on.",
+        ])
+      : rng.pick([
+          "output, the signal I was looking for is present.",
+          "output, the evidence supports the next step of the attack chain.",
+          "output, this is the concrete detail I needed before escalating.",
+          "output, the pattern matches what a vulnerable endpoint looks like.",
+        ]);
+    mandatoryAttribution = `\n\n${verb} \`${t}\` ${tail}`;
+  }
 
   // FIX #7: Add grounding paragraph that references tool output data
   let grounding = "";
@@ -95,17 +185,36 @@ export function generateGroundedResponse(
     }
   }
 
-  // FIX #3: For failure/soft-fail, include explicit "not vulnerable" language
+  // FIX #3 + #13: For failure/soft-fail, include observation-aware narrative.
+  // Earlier runs contradicted observations — e.g. "Connection refused" followed
+  // by "rate limiting was effective". Pick the failure class from the actual
+  // observation so analysis matches what the tool returned.
   let failureNote = "";
   if (isFailure) {
-    failureNote = `\n\n${rng.pick([
-      "**Result: Not vulnerable.** The endpoint properly handles this attack class.",
-      "This parameter appears to be safely handled. The application is not vulnerable to this specific technique.",
-      "**Negative result** — the target's defenses are effective here. Moving on to alternative approaches.",
-      "No exploitable behavior detected. The input validation is working correctly on this endpoint.",
-      "The test confirms this endpoint is **not vulnerable** to this attack. I'll document this as a positive defense.",
-      "After thorough testing, I can confirm this specific vector is blocked. The security control is effective.",
-    ])}`;
+    const cls = classifyFailure(toolOutputSummary);
+    const byClass: Record<string, string[]> = {
+      unreachable: [
+        "**Result: target unreachable.** The tool could not complete the request — the host is either offline, behind a firewall blocking this source, or the service is down. No vulnerability signal either way.",
+        "The connection was refused before any application-layer test ran. I can't conclude anything about this endpoint from this attempt — need to retry or pivot.",
+        "Connection-level failure. The evidence here is about infrastructure state, not application security. I'll document the attempt and move on.",
+      ],
+      ratelimited: [
+        "**Result: rate-limited.** The target started throttling before I could fully exercise this vector. Inconclusive — I'd need to slow the test or rotate sources to get a clean read.",
+        "HTTP 429 responses cut the test short. The control is effective at this rate, but that doesn't confirm the underlying endpoint is safe — just that I can't test it at volume.",
+      ],
+      blocked: [
+        "**Result: blocked by protective control.** The WAF / input filter intercepted the payloads. This attack class is mitigated at the edge; the underlying endpoint may still be vulnerable if the control can be bypassed.",
+        "The protective layer caught the payloads consistently. Worth trying encoding, case variation, or a different vector, but for the current technique: blocked.",
+      ],
+      timeout: [
+        "**Result: request timed out.** No conclusive signal — the target may be slow, behind a proxy, or dropping this request class. Inconclusive rather than safe.",
+      ],
+      generic: [
+        "**Result: not vulnerable to this specific technique.** The endpoint handled the payload class correctly. I'll document this as a negative test and pivot to another vector.",
+        "No exploitable behavior detected in this test. Input validation for this attack class appears to be working. I'll try adjacent vectors before concluding the endpoint is safe overall.",
+      ],
+    };
+    failureNote = `\n\n${rng.pick(byClass[cls] || byClass.generic)}`;
   }
 
   // FIX #4: Longer response when thinking is present (thinking should produce deeper analysis)
@@ -118,7 +227,7 @@ export function generateGroundedResponse(
     ])}`;
   }
 
-  return `${response}${opening}${grounding}${failureNote}${deeperAnalysis}`;
+  return `${response}${opening}${mandatoryAttribution}${grounding}${failureNote}${deeperAnalysis}`;
 }
 
 // Response Variation Engine (opening sentence generator)
@@ -127,7 +236,8 @@ export function generateAnalysisResponse(
   phase: AttackPhase,
   profile: TargetProfile,
   domain: string,
-  isFailure: boolean
+  isFailure: boolean,
+  actualTools: string[] = []
 ): string {
   // Dynamic header — combine phase name with unique framing
   const headerStyles = [
@@ -147,7 +257,10 @@ export function generateAnalysisResponse(
   const paramStr = rng.pick(profile.injectableParams);
   const portStr = String(rng.pick(profile.openPorts));
   const subStr = rng.pick(profile.subdomains);
-  const toolStr = rng.pick(phase.tools);
+  // Prefer the names of the tools that actually ran. Only fall back to the
+  // scenario's phase.tools list when no actual call happened (non-tool-calling
+  // phase), so narration never names a tool that was not invoked.
+  const toolStr = rng.pick(actualTools.length > 0 ? actualTools : phase.tools);
   const payloadCount = rng.int(3, 50);
   const responseTime = rng.int(12, 4500);
   const statusCode = rng.pick([200, 301, 302, 400, 403, 404, 500, 502, 503]);
@@ -292,8 +405,8 @@ export function generateAnalysisResponse(
 
   // Generate body with inline exploit code when appropriate
   const body = isFailure
-    ? generateFailureAnalysis(rng, phase, profile, domain)
-    : generateSuccessAnalysis(rng, phase, profile, domain);
+    ? generateFailureAnalysis(rng, phase, profile, domain, actualTools)
+    : generateSuccessAnalysis(rng, phase, profile, domain, actualTools);
 
   // Dynamic next steps — incorporate specific context
   const nextAction = variateText(phase.next_action, domain, profile);
@@ -309,7 +422,8 @@ export function generateAnalysisResponse(
   return `${rng.pick(headerStyles)}\n\n${opening}\n\n${body}\n\n${rng.pick(nextStepFormats)}`;
 }
 
-export function generateSuccessAnalysis(rng: SeededRNG, phase: AttackPhase, profile: TargetProfile, domain: string): string {
+export function generateSuccessAnalysis(rng: SeededRNG, phase: AttackPhase, profile: TargetProfile, domain: string, actualTools: string[] = []): string {
+  const toolPool = actualTools.length > 0 ? actualTools : phase.tools;
   const analysis = variateText(phase.analysis, domain, profile);
 
   const extras: string[] = [];
@@ -337,8 +451,11 @@ export function generateSuccessAnalysis(rng: SeededRNG, phase: AttackPhase, prof
     ])}.`);
   }
 
-  // Inline exploit code (boosted to 45%)
-  if (rng.bool(0.45)) {
+  // FIX #17: Inline exploit code — dialed from 45% to 20% of success turns.
+  // Earlier runs put code fences in ~100% of filtered entries, training the
+  // model to wedge a fenced block into every analysis. Keep code for when it
+  // genuinely adds evidence, not as a reflex.
+  if (rng.bool(0.2)) {
     const param = rng.pick(profile.injectableParams);
     const exploitCodeBlocks = [
       `\n\nI wrote a quick verification script to confirm the finding:\n\n\`\`\`python\nimport requests\n\ntarget = "https://${domain}/api/${rng.pick(["search", "users", "data", "query"])}"\nheaders = {"Authorization": "Bearer $TOKEN", "Content-Type": "application/json"}\n\n# Baseline request\nbaseline = requests.get(target, params={"${param}": "normal_value"}, headers=headers)\n\n# Injection test\ninjection = requests.get(target, params={"${param}": "${rng.pick(["' OR 1=1--", "{{7*7}}", "; id", "http://169.254.169.254/", "../../../etc/passwd"])}"}, headers=headers)\n\nprint(f"Baseline: {baseline.status_code} ({len(baseline.text)} bytes)")\nprint(f"Injection: {injection.status_code} ({len(injection.text)} bytes)")\n\nif baseline.status_code != injection.status_code or abs(len(baseline.text) - len(injection.text)) > 50:\n    print("[+] Differential response detected — likely vulnerable!")\nelse:\n    print("[-] Consistent responses — parameter may be safe")\n\`\`\`\n\nThe script confirmed the differential response.`,
@@ -365,12 +482,12 @@ export function generateSuccessAnalysis(rng: SeededRNG, phase: AttackPhase, prof
     ])}`);
   }
 
-  // Tool verification
+  // Tool verification — name a tool that actually ran this turn.
   if (rng.bool(0.35)) {
-    const toolMention = rng.pick(phase.tools);
+    const toolMention = rng.pick(toolPool);
     extras.push(`\n\n${rng.pick([
-      `I verified this using both ${toolMention} (automated) and manual curl requests. Both approaches produced consistent results, confirming this is a true positive.`,
-      `The ${toolMention} scanner initially flagged this. I then manually confirmed it by crafting ${rng.int(3, 10)} targeted payloads to rule out false positives.`,
+      `I verified this using ${toolMention} and manual follow-up requests. Both approaches produced consistent results, confirming this is a true positive.`,
+      `The ${toolMention} run initially flagged this. I then manually confirmed it by crafting ${rng.int(3, 10)} targeted payloads to rule out false positives.`,
       `${toolMention} reported ${rng.int(1, 5)} findings on this endpoint. After manual triage, ${rng.int(1, 3)} are confirmed exploitable vulnerabilities.`,
     ])}`);
   }
@@ -378,7 +495,8 @@ export function generateSuccessAnalysis(rng: SeededRNG, phase: AttackPhase, prof
   return analysis + extras.join("");
 }
 
-export function generateFailureAnalysis(rng: SeededRNG, phase: AttackPhase, profile: TargetProfile, domain: string): string {
+export function generateFailureAnalysis(rng: SeededRNG, phase: AttackPhase, profile: TargetProfile, domain: string, actualTools: string[] = []): string {
+  const toolPool = actualTools.length > 0 ? actualTools : phase.tools;
   const failureReasons = [
     `The application's input validation caught my test payloads. The ${rng.pick(profile.technologies)} framework appears to have built-in protection against this specific attack class.`,
     `A WAF or input filter is stripping/blocking the injection characters before they reach the backend. I observed ${rng.pick(["HTTP 403 responses", "HTML-encoded output", "silently dropped characters", "generic error messages replacing the expected behavior"])}.`,
@@ -403,7 +521,7 @@ export function generateFailureAnalysis(rng: SeededRNG, phase: AttackPhase, prof
     "I'll try the same vulnerability class with different encoding techniques to bypass the filter.",
     "I'll test adjacent endpoints that might share vulnerable code but lack the same protection.",
     "I'll switch to manual testing with targeted payloads instead of automated scanning.",
-    `I'll write a custom Python script to test edge cases that ${rng.pick(phase.tools)} might miss.`,
+    `I'll write a custom Python script to test edge cases that ${rng.pick(toolPool)} might miss.`,
     "I'll test using different HTTP methods — sometimes only one method is properly validated.",
     "I'll look for second-order injection points where the payload is stored and triggered in a different context.",
     `I'll check if the ${rng.pick(["API", "mobile API", "v1 API", "internal API"])} has the same protection.`,

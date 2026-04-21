@@ -42,11 +42,13 @@ export function registerExportTools(server: McpServer) {
                 else if (msg.from === "tool" || msg.from === "observation") role = "observation";
                 else role = msg.from;
 
-                let msgContent = "";
-                if (msg.thinking && args.filter_thinking !== "exclude") msgContent += `<think>\n${msg.thinking}\n</think>\n\n`;
-                msgContent += msg.value || "";
+                let msgContent = msg.value || "";
+                if (msg.thinking && args.filter_thinking !== "exclude" && !msgContent.includes("<think>")) {
+                  msgContent = `<think>\n${msg.thinking}\n</think>\n\n${msgContent}`;
+                }
 
-                if (role === "assistant" && msg.tool_calls?.length > 0) {
+                const inlineToolCallCount = (msgContent.match(/<tool_call>/g) || []).length;
+                if (role === "assistant" && msg.tool_calls?.length > 0 && inlineToolCallCount < msg.tool_calls.length) {
                   msgContent += "\n\n" + msg.tool_calls.map((tc: any) =>
                     `<tool_call>\n{"name": "${tc.name}", "arguments": ${JSON.stringify(tc.arguments)}}\n</tool_call>`
                   ).join("\n");

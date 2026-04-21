@@ -17,7 +17,7 @@ import {
   DOMAINS,
 } from "./prompts.js";
 import { generateSystemPrompt } from "./system-prompts.js";
-import { variateText, generateGroundedResponse } from "./responses.js";
+import { variateText, generateGroundedResponse, generateIntentResponse, classifyFailure } from "./responses.js";
 import { generateUniqueReport, generateDeepAnalysis } from "./reports.js";
 import { postProcessForQwen } from "./post-processor.js";
 import { estimateTokens } from "./post-processor.js";
@@ -177,6 +177,11 @@ export function buildConversationV2(
 
   const includeThinking = rng.bool(config.thinkingRatio);
   const includeFailures = rng.bool(config.failureRatio);
+  // FIX #19: Triage slice. ~18% of entries are quick triage conversations —
+  // 1–2 phases, a brief finding summary instead of a formal CVSS/remediation
+  // report. Teaches the model that not every pentest task ends in a full
+  // report, so it doesn't always steer toward report mode.
+  const isTriage = rng.bool(0.18);
 
   const messages: ShareGPTMessage[] = [];
   const toolsUsed: string[] = [];
@@ -202,22 +207,38 @@ export function buildConversationV2(
   const targetDesc = variateText(scenario.target_description, domain, profile);
   const techStr = `${profile.technologies.join("/")} with ${profile.databases.name} database`;
 
-  const initialPrompt = rng.pick(USER_PROMPTS_INITIAL)
-    .replace(/\{domain\}/g, domain)
-    + `\n\nTarget context: ${targetDesc}\nTechnology: ${techStr}`;
+  const triagePrompts = [
+    `Quick triage on ${domain} — is the ${scenario.subcategory.toLowerCase()} issue worth a deeper look, or can we rule it out fast?`,
+    `Can you do a fast check on ${domain} for ${scenario.subcategory.toLowerCase()}? Just want a go/no-go before I book time for full testing.`,
+    `Give me a quick read on whether ${domain} has a ${scenario.subcategory.toLowerCase()} exposure. Short answer is fine.`,
+    `I only have ~10 minutes — confirm or reject the ${scenario.subcategory.toLowerCase()} hypothesis on ${domain}.`,
+    `Fast triage: does ${domain} look exposed to ${scenario.subcategory.toLowerCase()}? No full report needed, just the call.`,
+  ];
+  const initialPrompt = isTriage
+    ? rng.pick(triagePrompts) + `\n\nTarget context: ${targetDesc}`
+    : rng.pick(USER_PROMPTS_INITIAL).replace(/\{domain\}/g, domain)
+        + `\n\nTarget context: ${targetDesc}\nTechnology: ${techStr}`;
 
   messages.push({ from: "human", value: initialPrompt });
 
   // FIX #1: Randomize phase order — sometimes skip phases, sometimes reorder
   let phases = [...scenario.attack_phases];
-  const structureVariant = rng.int(0, 4);
-  if (structureVariant === 1 && phases.length > 3) {
-    // Skip one middle phase
-    const skipIdx = rng.int(1, phases.length - 2);
-    phases = phases.filter((_, i) => i !== skipIdx);
-  } else if (structureVariant === 2 && phases.length > 2) {
-    // Merge first two phases into one
-    phases = [phases[0], ...phases.slice(2)];
+  if (isTriage) {
+    // Triage conversations only cover 1–2 phases — the analyst is doing a
+    // quick check, not a full chain. Picks the most diagnostic phase (usually
+    // the first or the detection phase) plus optionally one more.
+    const phaseCount = rng.pick([1, 1, 2]);
+    phases = phases.slice(0, phaseCount);
+  } else {
+    const structureVariant = rng.int(0, 4);
+    if (structureVariant === 1 && phases.length > 3) {
+      // Skip one middle phase
+      const skipIdx = rng.int(1, phases.length - 2);
+      phases = phases.filter((_, i) => i !== skipIdx);
+    } else if (structureVariant === 2 && phases.length > 2) {
+      // Merge first two phases into one
+      phases = [phases[0], ...phases.slice(2)];
+    }
   }
   // structureVariant 0, 3, 4 = normal order (60% of entries)
 
@@ -229,6 +250,11 @@ export function buildConversationV2(
   // Track tool outputs for grounding
   let lastToolOutputSummary = "";
   let lastFindingSummary = "";
+  // Per-entry curl budget — suppress runaway curl usage. Scenario templates are
+  // heavily curl-biased; capping per entry is the only way to break the 88%+
+  // curl-occurrence rate without rewriting every scenario file.
+  // Distribution: ~50% of entries get zero curl, ~33% get one, ~17% get two.
+  let curlCallsRemaining = rng.pick([0, 0, 0, 1, 1, 2]);
 
   // 4. Phase-by-phase conversation generation
   for (let phaseIdx = 0; phaseIdx < phases.length; phaseIdx++) {
@@ -243,7 +269,112 @@ export function buildConversationV2(
 
     // FIX #9: Vary command construction — don't always use template commands
     const cmdCount = rng.int(1, Math.min(phase.commands.length, rng.int(2, 5)));
-    const selectedCmds = rng.pickN(phase.commands.filter(c => !c.startsWith("#") && c.trim() !== ""), cmdCount);
+    const cleanCmds = phase.commands.filter(c => !c.startsWith("#") && c.trim() !== "");
+    // FIX #10: Bias selection toward commands whose primary tool hasn't been used yet
+    // in this entry, so tool coverage spreads across scenario.tools_involved.
+    // Also enforce per-entry curl budget — when it's exhausted, drop curl commands
+    // from the candidate pool entirely.
+    const usedSet = new Set(toolsUsed);
+    const dropCurl = curlCallsRemaining <= 0;
+    // FIX #16b: Curl-budget exhausted → rewrite curl commands. Instead of
+    // defaulting to httpx/python_script (which just shifts the monoculture),
+    // route each rewrite to a scenario-appropriate native tool based on the
+    // URL shape, request method, and scenario tags. Falls back to httpx only
+    // when nothing else fits.
+    const rewriteCurl = (c: string): string => {
+      if (!c.includes("curl")) return c;
+      const urlMatch = c.match(/https?:\/\/\S+/);
+      const url = urlMatch ? urlMatch[0].replace(/['"`,;]/g, "") : `https://${domain}/`;
+      const method = /-X\s+(POST|PUT|DELETE|PATCH)/i.test(c) ? (c.match(/-X\s+(POST|PUT|DELETE|PATCH)/i) as RegExpMatchArray)[1].toUpperCase() : "GET";
+      const headers = [...c.matchAll(/-H\s+['"]([^'"]+)['"]/g)].map(m => m[1]);
+      const body = c.match(/-d\s+['"]([^'"]+)['"]/)?.[1];
+
+      // Scenario-appropriate rewrite targets. Order matters: most specific first.
+      const candidates: Array<{ tool: string; command: string; fitness: number }> = [];
+
+      const tags = new Set(scenario.tags.map(t => t.toLowerCase()));
+      const toolsPool = new Set(scenario.tools_involved);
+
+      // SQLi scenarios: route to sqlmap if it's in scope, regardless of method.
+      if ((tags.has("sqli") || tags.has("injection") || tags.has("nosql")) && toolsPool.has("sqlmap")) {
+        candidates.push({ tool: "sqlmap", command: `sqlmap -u "${url}" --batch --level=3 --risk=2 --random-agent`, fitness: 9 });
+      }
+      if (tags.has("nosql") && toolsPool.has("nosqlmap")) {
+        candidates.push({ tool: "nosqlmap", command: `nosqlmap -u ${url} --batch`, fitness: 9 });
+      }
+      // JWT scenarios: jwt_tool decode/inspect
+      if ((tags.has("jwt") || tags.has("auth-bypass") || /Authorization:.*Bearer/i.test(headers.join(" "))) && toolsPool.has("jwt_tool")) {
+        const tokenMatch = headers.join(" ").match(/Bearer\s+([A-Za-z0-9._-]+)/);
+        const tok = tokenMatch ? tokenMatch[1] : "$TOKEN";
+        candidates.push({ tool: "jwt_tool", command: `jwt_tool ${tok} -T`, fitness: 8 });
+      }
+      // XSS scenarios: dalfox scan
+      if (tags.has("xss") && toolsPool.has("dalfox")) {
+        candidates.push({ tool: "dalfox", command: `dalfox url ${url}`, fitness: 8 });
+      }
+      // Dir/endpoint discovery: ffuf / feroxbuster
+      if (/FUZZ|\/api\/|\/v1\/|\/v2\/|fuzz/i.test(c)) {
+        if (toolsPool.has("ffuf")) candidates.push({ tool: "ffuf", command: `ffuf -u ${url.replace(/FUZZ/g, "") || url}/FUZZ -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt -mc 200,301,302,403`, fitness: 7 });
+        if (toolsPool.has("feroxbuster")) candidates.push({ tool: "feroxbuster", command: `feroxbuster -u ${url} -t 50 --silent`, fitness: 6 });
+      }
+      // Vuln probe endpoints: nuclei
+      if (tags.has("ssrf") || tags.has("xxe") || tags.has("ssti") || tags.has("rce") || toolsPool.has("nuclei")) {
+        candidates.push({ tool: "nuclei", command: `nuclei -u ${url} -severity medium,high,critical -silent`, fitness: 6 });
+      }
+      // Arg discovery: arjun
+      if (tags.has("idor") || tags.has("mass-assignment") || /\?[a-z_]+=/i.test(url)) {
+        if (toolsPool.has("arjun")) candidates.push({ tool: "arjun", command: `arjun -u ${url} -m ${method}`, fitness: 5 });
+      }
+      // LDAP / 2FA / race: python script is genuinely the right tool.
+      if (tags.has("race-condition") || tags.has("2fa-bypass") || tags.has("logic")) {
+        const headerDict = headers.length ? `, headers={${headers.map(h => { const [k, ...v] = h.split(":"); return `'${k.trim()}': '${v.join(":").trim()}'`; }).join(", ")}}` : "";
+        const bodyArg = body ? `, data=${JSON.stringify(body)}` : "";
+        candidates.push({ tool: "python_script", command: `python3 -c "import requests; r = requests.request('${method}', '${url}'${headerDict}${bodyArg}, timeout=15); print(r.status_code, r.headers.get('content-type','')); print(r.text[:2000])"`, fitness: 5 });
+      }
+      // Generic GET fallback: httpx is the honest default for "fetch and inspect".
+      if (method === "GET") {
+        const hdr = headers[0] ? ` -H '${headers[0]}'` : "";
+        candidates.push({ tool: "httpx", command: `httpx -u ${url} -status-code -title -tech-detect -follow-redirects${hdr}`, fitness: 3 });
+      }
+      // Last-resort python for POST/PUT when nothing scenario-specific fits.
+      if (candidates.length === 0 || method !== "GET") {
+        const headerDict = headers.length ? `, headers={${headers.map(h => { const [k, ...v] = h.split(":"); return `'${k.trim()}': '${v.join(":").trim()}'`; }).join(", ")}}` : "";
+        const bodyArg = body ? `, data=${JSON.stringify(body)}` : "";
+        candidates.push({ tool: "python_script", command: `python3 -c "import requests; r = requests.request('${method}', '${url}'${headerDict}${bodyArg}, timeout=15); print(r.status_code, r.headers.get('content-type','')); print(r.text[:2000])"`, fitness: 2 });
+      }
+
+      // Penalize tools already heavily used this entry to spread distribution.
+      const usageCounts = toolsUsed.reduce((acc: Record<string, number>, t) => { acc[t] = (acc[t] || 0) + 1; return acc; }, {});
+      const scored = candidates.map(c => ({ ...c, score: c.fitness - (usageCounts[c.tool] || 0) * 2 }));
+      scored.sort((a, b) => b.score - a.score);
+      // Top-fitness candidates with some randomness to avoid deterministic rewrites.
+      const topTier = scored.filter(s => s.score >= scored[0].score - 2);
+      return rng.pick(topTier).command;
+    };
+    const candidatePool = dropCurl
+      ? cleanCmds.map(c => identifyToolFromCommand(c) === "curl" ? rewriteCurl(c) : c)
+      : cleanCmds;
+    const freshCmds = candidatePool.filter(c => {
+      const t = identifyToolFromCommand(c);
+      return t && !usedSet.has(t) && t !== "curl";
+    });
+    const staleCmds = candidatePool.filter(c => !freshCmds.includes(c));
+    let selectedCmds: string[];
+    if (candidatePool.length === 0) {
+      // Every command this phase was curl and budget is spent. Skip the whole
+      // phase — no tool calls, no synthetic analysis — to avoid emitting
+      // "analysis without evidence" turns that hurt tool-use training.
+      continue;
+    } else if (freshCmds.length >= cmdCount) {
+      selectedCmds = rng.pickN(freshCmds, cmdCount);
+    } else if (freshCmds.length > 0) {
+      selectedCmds = [
+        ...rng.pickN(freshCmds, freshCmds.length),
+        ...rng.pickN(staleCmds, cmdCount - freshCmds.length),
+      ];
+    } else {
+      selectedCmds = rng.pickN(candidatePool, cmdCount);
+    }
 
     for (let cmdIdx = 0; cmdIdx < selectedCmds.length; cmdIdx++) {
       let cmd = variateText(selectedCmds[cmdIdx], domain, profile);
@@ -257,7 +388,10 @@ export function buildConversationV2(
 
       const toolCallId = `call_${entryIndex}_${phaseIdx}_${cmdIdx}_${rng.int(10000, 99999)}`;
       const toolName = identifyToolFromCommand(cmd);
-      if (toolName) toolsUsed.push(toolName);
+      if (toolName) {
+        toolsUsed.push(toolName);
+        if (toolName === "curl") curlCallsRemaining--;
+      }
 
       toolCalls.push({
         id: toolCallId,
@@ -283,52 +417,94 @@ export function buildConversationV2(
     // FIX #7: Build grounding context from tool outputs
     lastToolOutputSummary = toolOutputTexts.join(" | ").slice(0, 300);
 
-    // Generate thinking block — FIX #4: make it LONGER when present
+    // FIX #15: observation-aware thinking. Classify the actual tool output
+    // first and let the classification (not just phase metadata) drive which
+    // thinking generator runs. If the observation shows a hard failure
+    // (Connection refused, 429, WAF block, timeout), force failure-thinking
+    // so the reasoning can't claim "no injectable parameters found" when the
+    // real problem was that the host was unreachable.
+    const obsFailClass = lastToolOutputSummary ? classifyFailure(lastToolOutputSummary) : "generic";
+    const obsSaysHardFailure = obsFailClass !== "generic";
+    const realIsFailure = isFailurePhase || isSoftFail || obsSaysHardFailure;
+
     let thinkingBlock: string | undefined;
     if (includeThinking) {
-      if (isFailurePhase) {
-        thinkingBlock = thinkingEngine.generateFailureThinking(domain, profile, phase.phase,
-          rng.pick(["WAF blocked the payload", "parameter validation prevented injection", "rate limiting kicked in", "the endpoint returned consistent responses", "no injectable parameters found"]));
-      } else if (phaseIdx === 0) {
-        thinkingBlock = thinkingEngine.generateReconThinking(domain, profile, [phase.analysis]);
-      } else if (phase.phase.toLowerCase().includes("enum") || phase.phase.toLowerCase().includes("discover")) {
-        thinkingBlock = thinkingEngine.generateEnumThinking(domain, profile, phase.phase);
-      } else if (phase.phase.toLowerCase().includes("exploit") || phase.phase.toLowerCase().includes("attack")) {
-        thinkingBlock = thinkingEngine.generateExploitThinking(domain, profile, scenario.subcategory, phase.analysis);
+      if (realIsFailure) {
+        const why = ({
+          unreachable: "the target was unreachable — connection refused or the host is offline, so no application-layer signal was produced",
+          ratelimited: "rate limiting kicked in and cut the test short — the result is inconclusive, not safe",
+          blocked: "the WAF / input filter intercepted the payloads before they reached the application logic",
+          timeout: "the request timed out — no response came back, so no vulnerability signal either way",
+          generic: rng.pick([
+            "no exploitable behavior was detected for this specific technique",
+            "input validation appears to handle this payload class correctly",
+            "the endpoint returned consistent responses across payload variations",
+          ]),
+        } as Record<string, string>)[obsFailClass] || "no exploitable signal was observed";
+        thinkingBlock = thinkingEngine.generateFailureThinking(domain, profile, phase.phase, why);
       } else {
-        thinkingBlock = thinkingEngine.generateVulnAnalysisThinking(domain, profile, scenario.subcategory, phase.analysis);
+        // Feed the actual observation summary as evidence so reasoning is
+        // grounded in what the tool returned, not just phase.analysis.
+        const evidence = lastToolOutputSummary && lastToolOutputSummary.length > 30
+          ? lastToolOutputSummary
+          : phase.analysis;
+        if (phaseIdx === 0) {
+          thinkingBlock = thinkingEngine.generateReconThinking(domain, profile, [evidence]);
+        } else if (phase.phase.toLowerCase().includes("enum") || phase.phase.toLowerCase().includes("discover")) {
+          thinkingBlock = thinkingEngine.generateEnumThinking(domain, profile, phase.phase);
+        } else if (phase.phase.toLowerCase().includes("exploit") || phase.phase.toLowerCase().includes("attack")) {
+          thinkingBlock = thinkingEngine.generateExploitThinking(domain, profile, scenario.subcategory, evidence);
+        } else {
+          thinkingBlock = thinkingEngine.generateVulnAnalysisThinking(domain, profile, scenario.subcategory, evidence);
+        }
       }
     }
 
-    // FIX #2 + #4 + #7: Generate response — varied format, grounded in tool output, longer with thinking
-    const assistantResponse = generateGroundedResponse(rng, phase, profile, domain, isFailurePhase || isSoftFail, lastToolOutputSummary, includeThinking);
-    lastFindingSummary = assistantResponse.slice(0, 150);
-
-    messages.push({
-      from: "gpt",
-      value: assistantResponse,
-      thinking: thinkingBlock,
-      tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-    });
-
-    // Tool results — FIX #1: sometimes put tool results BEFORE gpt analysis
-    if (toolResults.length > 0) {
-      // 30% of the time: swap order so tool output comes first, then GPT analyzes
-      if (rng.bool(0.3) && messages.length >= 2) {
-        const gptMsg = messages.pop()!;
-        messages.push({
-          from: "tool",
-          value: toolResults.map(r => `[${r.name}] Output:\n${r.output}`).join("\n\n---\n\n"),
-          tool_results: toolResults,
-        });
-        messages.push(gptMsg);
-      } else {
-        messages.push({
-          from: "tool",
-          value: toolResults.map(r => `[${r.name}] Output:\n${r.output}`).join("\n\n---\n\n"),
-          tool_results: toolResults,
-        });
-      }
+    // FIX #11 (causal tool-use) + FIX #12 (thinking placement):
+    //   Pre-call thinking blocks were outcome-oriented (they came from helpers
+    //   that assume a finding already exists). When attached to the intent
+    //   turn, they leak results before the tool runs. The fix is to attach
+    //   thinking ONLY to the post-observation analysis turn — by then the
+    //   tool output exists and reasoning about it is causally valid.
+    //
+    //   Intent narration also now uses the actual tool names from the
+    //   selected tool_calls instead of phase.tools, so the narration can't
+    //   name a different tool than the one actually invoked.
+    if (toolCalls.length > 0) {
+      const actualToolNames = toolCalls.map(tc => tc.name);
+      const intent = generateIntentResponse(rng, phase, profile, domain, actualToolNames);
+      messages.push({
+        from: "gpt",
+        value: intent,
+        tool_calls: toolCalls,
+        // no thinking here — tool hasn't run yet
+      });
+      messages.push({
+        from: "tool",
+        value: toolResults.map(r => `[${r.name}] Output:\n${r.output}`).join("\n\n---\n\n"),
+        tool_results: toolResults,
+      });
+      // Use realIsFailure — derived from the actual observation — not just
+      // the phase-level flag, so visible analysis and failure note match
+      // what the tool really returned.
+      const grounded = generateGroundedResponse(rng, phase, profile, domain, realIsFailure, lastToolOutputSummary, includeThinking, actualToolNames);
+      lastFindingSummary = grounded.slice(0, 150);
+      messages.push({
+        from: "gpt",
+        value: grounded,
+        thinking: thinkingBlock,
+      });
+    } else {
+      // No tool calls this phase (curl-only phase with empty budget). Single
+      // analysis turn; thinking is fine here since no tool output is being
+      // pre-empted.
+      const grounded = generateGroundedResponse(rng, phase, profile, domain, realIsFailure, lastToolOutputSummary, includeThinking, []);
+      lastFindingSummary = grounded.slice(0, 150);
+      messages.push({
+        from: "gpt",
+        value: grounded,
+        thinking: thinkingBlock,
+      });
     }
 
     // FIX #8: Contextual user follow-ups referencing prior findings
@@ -376,24 +552,85 @@ export function buildConversationV2(
     }
   }
 
-  // 5. Final reporting turn — FIX #5 (reports): always include CVSS + evidence + remediation
-  messages.push({
-    from: "human",
-    value: rng.pick(USER_PROMPTS_REPORT).replace(/\{vulnType\}/g, scenario.title),
-  });
+  // FIX #10b: Tool-spotlight pass — if scenario declares tools that never got called,
+  // insert a dedicated turn that exercises one of them. Spreads tool coverage without
+  // editing every scenario template.
+  // Triage entries skip this — they're supposed to be short.
+  const missingTools = scenario.tools_involved.filter(t => t !== "curl" && !toolsUsed.includes(t));
+  if (!isTriage && missingTools.length > 0 && rng.bool(0.7)) {
+    const spotlightTool = rng.pick(missingTools);
+    const toolDef = PENTESTING_TOOLS.find(t => t.name === spotlightTool);
+    const spotlightCmd = toolDef?.example_commands?.[0]
+      ? variateText(toolDef.example_commands[0], domain, profile)
+      : `${spotlightTool} ${domain}`;
+    const callId = `call_${entryIndex}_spotlight_${rng.int(10000, 99999)}`;
 
-  const reportThinking = includeThinking
-    ? thinkingEngine.generateReportThinking(domain, scenario.subcategory, scenario.difficulty, scenario.attack_phases.map(p => p.phase))
-    : undefined;
+    messages.push({
+      from: "human",
+      value: `Good. Now run a focused ${spotlightTool} pass against ${domain} — I want to cross-check with a different tool before we write this up.`,
+    });
 
-  messages.push({
-    from: "gpt",
-    value: generateUniqueReport(scenario, domain, profile, rng),
-    thinking: reportThinking,
-  });
+    const spotOutput = generateDynamicOutput(outputEngine, spotlightTool, domain, profile, scenario.attack_phases[0], rng);
+    messages.push({
+      from: "gpt",
+      value: `Running ${spotlightTool} to corroborate the earlier findings.`,
+      tool_calls: [{ id: callId, name: spotlightTool, arguments: { command: spotlightCmd } }],
+    });
+    messages.push({
+      from: "tool",
+      value: `[${spotlightTool}] Output:\n${spotOutput}`,
+      tool_results: [{ tool_call_id: callId, name: spotlightTool, output: spotOutput }],
+    });
+    const priorTool = toolsUsed.length > 0 ? toolsUsed[toolsUsed.length - 1] : "the earlier scan";
+    messages.push({
+      from: "gpt",
+      value: `${spotlightTool} confirms the earlier result — ${rng.pick([
+        "same vulnerable surface, slightly different signature",
+        `consistent with what ${priorTool} showed but with extra metadata`,
+        "adds confidence that this isn't a false positive",
+        "matches the pattern from the first phase",
+      ])}. Ready for the report.`,
+    });
+    toolsUsed.push(spotlightTool);
+  }
 
-  // 6. Pad to minimum turns with deep analysis
-  while (countTurns(messages) < config.minTurns) {
+  // 5. Final turn — full report for normal entries, brief triage summary otherwise.
+  //    Triage entries end with a short verdict, not a CVSS/remediation report,
+  //    so the model sees that not every task ends in full report mode.
+  if (isTriage) {
+    const verdict = hasFailures
+      ? rng.pick([
+          `**Triage verdict:** no conclusive signal for ${scenario.subcategory.toLowerCase()} in the time I had. Not a confirmed rule-out — just nothing exploitable surfaced from this pass. Worth a deeper look if there's a specific reason to suspect it.`,
+          `**Quick read:** I didn't find an exploitable ${scenario.subcategory.toLowerCase()} path in this window. Could be a true negative, could be defended, could need a richer payload set. Flag if you want me to go deeper.`,
+        ])
+      : rng.pick([
+          `**Triage verdict:** ${scenario.subcategory.toLowerCase()} looks real on ${domain}. Not a full exploit write-up yet, but the signal is there. Worth booking proper testing time.`,
+          `**Quick read:** I'd call this a likely ${scenario.subcategory.toLowerCase()} issue based on what I saw. Not a certified finding, but I'd prioritize it for the full engagement.`,
+          `**Verdict:** high enough confidence to recommend a full pass on ${scenario.subcategory.toLowerCase()}. Short version: the endpoint behavior matches the pattern. Full report to follow when we have time.`,
+        ]);
+    messages.push({ from: "gpt", value: verdict });
+  } else {
+    messages.push({
+      from: "human",
+      value: rng.pick(USER_PROMPTS_REPORT).replace(/\{vulnType\}/g, scenario.title),
+    });
+    const reportThinking = includeThinking
+      ? thinkingEngine.generateReportThinking(domain, scenario.subcategory, scenario.difficulty, scenario.attack_phases.map(p => p.phase))
+      : undefined;
+    messages.push({
+      from: "gpt",
+      value: generateUniqueReport(scenario, domain, profile, rng),
+      thinking: reportThinking,
+    });
+  }
+
+  // 6. Pad to a per-entry target turn count sampled uniformly in [minTurns, maxTurns].
+  // Previously this only padded to minTurns, so 94% of entries had exactly minTurns turns.
+  // Triage entries skip padding — they're supposed to be short (4–8 turns).
+  const targetTurns = isTriage
+    ? countTurns(messages) // no padding
+    : rng.int(config.minTurns, Math.max(config.minTurns, config.maxTurns));
+  while (countTurns(messages) < targetTurns) {
     // FIX #8: Contextual deep analysis prompts
     messages.push({
       from: "human",
@@ -426,6 +663,7 @@ export function buildConversationV2(
       tools_used: [...new Set(toolsUsed)],
       has_thinking: includeThinking,
       has_failures: hasFailures,
+      is_triage: isTriage,
       turn_count: countTurns(finalMessages),
       cve_references: scenario.cve_references || [],
       estimated_tokens: estimateTokens(finalMessages),

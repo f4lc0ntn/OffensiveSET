@@ -68,7 +68,15 @@ export class ThinkingEngine {
   }
 
   generateFailureThinking(domain: string, profile: TargetProfile, whatFailed: string, why: string): string {
-    const approach = this.rng.pick(FAILURE_THINKING_TEMPLATES);
+    // When the observation indicates the target was simply unreachable (or the
+    // request timed out), the generic FAILURE_THINKING_TEMPLATES — which assume
+    // a WAF / input validation block — are causally wrong. Route to a dedicated
+    // network-level template so the reasoning doesn't claim a security control
+    // was effective when in reality no request reached the application.
+    const isNetworkFailure = /unreachable|offline|timed out|timeout/i.test(why);
+    const approach = isNetworkFailure
+      ? this.rng.pick(NETWORK_FAILURE_THINKING_TEMPLATES)
+      : this.rng.pick(FAILURE_THINKING_TEMPLATES);
     return this.fillThinkingTemplate(approach, {
       domain,
       whatFailed,
@@ -98,7 +106,7 @@ export class ThinkingEngine {
         "rate limiting kicked in, need to slow down and be more targeted",
         "the response behavior suggests there might be a different injectable point",
       ]),
-    });
+    }, /* isFailure */ true);
   }
 
   generatePostExploitThinking(domain: string, profile: TargetProfile, accessLevel: string): string {
@@ -158,11 +166,14 @@ export class ThinkingEngine {
   // Template filling
   // ============================================================
 
-  private fillThinkingTemplate(template: string, vars: Record<string, string>): string {
+  private fillThinkingTemplate(template: string, vars: Record<string, string>, isFailure = false): string {
     let result = template;
 
-    // Always inject hypothesis-driven reasoning prefix (60% of the time)
-    if (this.rng.bool(0.6)) {
+    // Inject hypothesis-driven reasoning prefix — but only for success paths.
+    // Failure thinking reasoning must not open with "what does the application
+    // behavior tell me about its internals" when the observation was
+    // Connection refused or a WAF block.
+    if (!isFailure && this.rng.bool(0.6)) {
       const hypothesisPrefixes = [
         `My working hypothesis: ${vars.domain || "the target"} is likely vulnerable because ${this.rng.pick(["the technology stack has known default misconfigurations", "the error responses suggest improper input handling", "the API design follows patterns commonly associated with authorization flaws", "the response behavior is inconsistent between normal and anomalous input", "the framework version is known to have security issues in this area"])}. Let me test this systematically.\n\n`,
         `Before diving in, let me form hypotheses about what I expect to find:\n- Hypothesis A: The ${vars.param || "input"} parameter is processed unsafely → test with injection probes\n- Hypothesis B: Authorization checks are missing at the object level → test with ID manipulation\n- Hypothesis C: The ${vars.techs || "application"} error handling leaks sensitive details → test with malformed input\nI'll test each hypothesis and eliminate the ones that don't hold.\n\n`,
@@ -495,6 +506,43 @@ Business impact translation:
 - Regulatory: Fines and mandatory breach notification costs
 
 I'm documenting every step of the exploitation chain because the client needs to understand not just THAT they're vulnerable, but HOW an attacker would progress through their systems. This attack narrative is what makes the difference between a mediocre pentest report and one that actually drives security improvements.`,
+];
+
+// Dedicated templates for network-level failures. These must not reference
+// WAFs, input validation, rate limiting, or any application-layer control,
+// because the observation (Connection refused, timeout) proves no application
+// logic was exercised.
+const NETWORK_FAILURE_THINKING_TEMPLATES = [
+  `The {whatFailed} step against {domain} could not complete at the network layer.
+
+What I observed: {why}
+
+This is not an application-security signal. The target never received my request in a state where it could respond, so I cannot draw any conclusion about whether the endpoint is vulnerable or not. A "safe" observation here would be wrong; a "vulnerable" observation would be equally wrong.
+
+My plan:
+- Treat this attempt as inconclusive and not as a defense success
+- Verify whether the host is actually up (different source, different path, general connectivity)
+- If the target is genuinely offline, I'll retry after a cool-off window or pivot to other subdomains in scope
+
+What I am NOT concluding:
+- I am not attributing this to any protective control on the application side
+- I am not concluding that the endpoint is safe — the payload never reached it
+
+Next up: {alternativeApproach}.`,
+
+  `{whatFailed} on {domain} failed at the transport layer. Time to be careful about what that tells me.
+
+Observation: {why}
+
+Analysis:
+A connection-level failure is a zero-bit-of-evidence event from the application's perspective. The server process may be down, the port may be closed, a firewall at the network layer may be dropping my source — all three look identical from here. None of them reveal anything about the application's security controls.
+
+What I'll do instead:
+1. Check basic reachability with a different path (other subdomain, alternate port)
+2. If still unreachable, flag it in the report as "not tested" rather than "not vulnerable"
+3. Shift focus to other scoped assets where I can actually run the attack chain
+
+Pivoting to {alternativeApproach}.`,
 ];
 
 const FAILURE_THINKING_TEMPLATES = [
